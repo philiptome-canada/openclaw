@@ -38,6 +38,7 @@ import { writeCronJobScratch } from "../cron/scratch-store.js";
 import { resolveCronJobsStorePathFromConfig } from "../cron/store.js";
 import { resolveAgentIdFromSessionKey } from "../routing/session-key.js";
 import { formatErrorMessage } from "./errors.js";
+import { readExecRequestOwners } from "./exec-request-context.js";
 import { classifyHeartbeatAgentOutcome } from "./heartbeat-delivery-normalization.js";
 import { HEARTBEAT_DELIVERY_CONTEXT_KEY_PREFIX } from "./heartbeat-events-filter.js";
 import { emitHeartbeatEvent, resolveIndicatorType } from "./heartbeat-events.js";
@@ -189,7 +190,11 @@ async function prepareHeartbeatDispatchReply(
     runState.admission.reason === "active-run" &&
     !response &&
     (!selected || !hasOutboundReplyContent(selected));
-  if (execution === "cancelled" || execution === "superseded" || admissionBusy) {
+  const execCancelled = () =>
+    prepared.inspectedSystemEventsToConsume.some((event) =>
+      readExecRequestOwners(event)?.some((owner) => owner.signal.aborted),
+    );
+  if (execution === "cancelled" || execution === "superseded" || admissionBusy || execCancelled()) {
     const reason =
       execution === "superseded"
         ? "preempted"
@@ -281,7 +286,7 @@ async function prepareHeartbeatDispatchReply(
       durationMs: Date.now() - startedAt,
       accountId: delivery.accountId,
     });
-    if (consume && preflight.shouldInspectPendingEvents) {
+    if (consume && !execCancelled() && preflight.shouldInspectPendingEvents) {
       consumeSelectedSystemEventEntries(resolveSystemEventQueueKey(sessionKey, agentId), [
         ...prepared.inspectedSystemEventsToConsume,
         ...prepared.deferredGenericEvents,
