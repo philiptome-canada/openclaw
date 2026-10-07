@@ -1,7 +1,6 @@
 import { isAgentRunRestartAbortReason } from "../../agents/run-termination.js";
 import type { SandboxContext } from "../../agents/sandbox/types.js";
 import type {
-  LocalTurnPlacementClaim,
   PreparedSessionPlacementSandbox,
   SessionPlacementAdmissionProvider,
 } from "../../agents/session-placement-admission.js";
@@ -180,25 +179,21 @@ export function createWorkerSessionTurnPlacementProvider(options: WorkerTurnLaun
       assertCurrent();
       return retain(sandbox, assertCurrent);
     },
-    async executeLocalTurn<T>(
-      claim: LocalTurnPlacementClaim,
-      runLocal: () => Promise<T>,
-      assertCurrent?: () => void,
-    ) {
-      return await executeLocalTurn({
+    executeLocalTurn: (claim, runLocal, assertCurrent) =>
+      executeLocalTurn({
         claim,
         placements: options.placements,
         runLocal,
         assertCurrent,
-      });
-    },
+      }),
     async executeTurn(claim, inputTurn, runLocal, onAdmitted, assertRunCurrent) {
       const restartSignal = getGatewayRestartDrainSignal();
-      const sessionlessModelRun = inputTurn.modelRun === true && !claim.sessionKey?.trim();
+      const assertCurrent = () => {
+        inputTurn.abortSignal?.throwIfAborted();
+        assertRunCurrent?.();
+      };
       const runLocalTurn = (
-        preparedPlacement?: Awaited<
-          ReturnType<WorkerSessionPlacementStore["prepareRuntimeRefresh"]>
-        >,
+        preparedPlacement?: Parameters<typeof executeLocalTurn>[0]["preparedPlacement"],
       ) =>
         executeLocalTurn({
           claim,
@@ -206,33 +201,25 @@ export function createWorkerSessionTurnPlacementProvider(options: WorkerTurnLaun
           runLocal,
           preparedPlacement,
           sessionReader: getReplyOperationSessionReader(inputTurn.replyOperation),
-          assertCurrent: () => {
-            inputTurn.abortSignal?.throwIfAborted();
-            assertRunCurrent?.();
-          },
+          assertCurrent,
         });
       const prepared = await options.placements.prepareRuntimeRefresh(claim.sessionId);
-      let current: WorkerSessionPlacementRecord | undefined;
-      let localPreparation: typeof prepared | undefined;
       try {
-        inputTurn.abortSignal?.throwIfAborted();
-        assertRunCurrent?.();
+        assertCurrent();
         prepared.assertCurrent();
-        current = prepared.placement;
-        if (current?.state === "local" || (!current && !sessionlessModelRun)) {
-          localPreparation = prepared;
-        }
-      } finally {
-        if (!localPreparation) {
-          prepared.release();
-        }
+      } catch (error) {
+        prepared.release();
+        throw error;
       }
-      if (!current && sessionlessModelRun) {
+      const current = prepared.placement;
+      if (!current && inputTurn.modelRun === true && !claim.sessionKey?.trim()) {
+        prepared.release();
         return await runLocal();
       }
       if (!current || current.state === "local") {
-        return await runLocalTurn(localPreparation);
+        return await runLocalTurn(prepared);
       }
+      prepared.release();
       const hasPendingWorkspaceResultToSettle = async (sessionId: string, runId: string) => {
         const facts = await options.placements.readProjection([sessionId], { current: true });
         const pending = facts.pendingResults.get(sessionId);
