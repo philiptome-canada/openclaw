@@ -5,6 +5,7 @@ import type {
   PreparedSessionPlacementSandbox,
   SessionPlacementAdmissionProvider,
 } from "../../agents/session-placement-admission.js";
+import { getReplyOperationSessionReader } from "../../auto-reply/reply/reply-run-registry.state.js";
 import {
   composeSessionSourceAssertion,
   createDynamicSessionSourceAssertion,
@@ -193,11 +194,18 @@ export function createWorkerSessionTurnPlacementProvider(options: WorkerTurnLaun
     },
     async executeTurn(claim, inputTurn, runLocal, onAdmitted, assertRunCurrent) {
       const restartSignal = getGatewayRestartDrainSignal();
-      const runLocalTurn = () =>
+      const sessionlessModelRun = inputTurn.modelRun === true && !claim.sessionKey?.trim();
+      const runLocalTurn = (
+        preparedPlacement?: Awaited<
+          ReturnType<WorkerSessionPlacementStore["prepareRuntimeRefresh"]>
+        >,
+      ) =>
         executeLocalTurn({
           claim,
           placements: options.placements,
           runLocal,
+          preparedPlacement,
+          sessionReader: getReplyOperationSessionReader(inputTurn.replyOperation),
           assertCurrent: () => {
             inputTurn.abortSignal?.throwIfAborted();
             assertRunCurrent?.();
@@ -205,19 +213,25 @@ export function createWorkerSessionTurnPlacementProvider(options: WorkerTurnLaun
         });
       const prepared = await options.placements.prepareRuntimeRefresh(claim.sessionId);
       let current: WorkerSessionPlacementRecord | undefined;
+      let localPreparation: typeof prepared | undefined;
       try {
         inputTurn.abortSignal?.throwIfAborted();
         assertRunCurrent?.();
         prepared.assertCurrent();
         current = prepared.placement;
+        if (current?.state === "local" || (!current && !sessionlessModelRun)) {
+          localPreparation = prepared;
+        }
       } finally {
-        prepared.release();
+        if (!localPreparation) {
+          prepared.release();
+        }
       }
-      if (!current && inputTurn.modelRun === true && !claim.sessionKey?.trim()) {
+      if (!current && sessionlessModelRun) {
         return await runLocal();
       }
       if (!current || current.state === "local") {
-        return await runLocalTurn();
+        return await runLocalTurn(localPreparation);
       }
       const hasPendingWorkspaceResultToSettle = async (sessionId: string, runId: string) => {
         const facts = await options.placements.readProjection([sessionId], { current: true });
