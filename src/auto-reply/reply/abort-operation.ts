@@ -2,11 +2,11 @@ import { normalizeOptionalString } from "@openclaw/normalization-core/string-coe
 import { getAcpSessionManager } from "../../acp/control-plane/manager.js";
 import { retireSessionMcpRuntime } from "../../agents/agent-bundle-mcp-manager-api.js";
 import { resolveSessionAgentId } from "../../agents/agent-scope.js";
+import { captureExecRequestCancellation } from "../../agents/bash-process-control.js";
 import { resolveActiveEmbeddedRunSessionId } from "../../agents/embedded-agent-runner/active-run-projections.js";
 import { abortEmbeddedAgentRun } from "../../agents/embedded-agent-runner/runs.js";
+import { captureExecRequestSubagentSelection } from "../../agents/subagents/registry/subagent-control-scope.js";
 import { killAllControlledSubagentRuns } from "../../agents/subagents/registry/subagent-control.js";
-import { subagentRuns } from "../../agents/subagents/registry/subagent-registry-memory.js";
-import { listRunsForControllerFromRuns } from "../../agents/subagents/registry/subagent-registry-queries.js";
 import {
   resolveInternalSessionKey,
   resolveMainSessionAlias,
@@ -145,8 +145,9 @@ export async function stopSubagentsForRequester(params: {
   cfg: OpenClawConfig;
   requesterSessionKey?: string;
   requesterAgentId?: string;
+  assertCurrent?: () => void;
   beforeKill?: Parameters<typeof killAllControlledSubagentRuns>[0]["beforeKill"];
-}): Promise<{ stopped: number; failed: number }> {
+}): Promise<{ stopped: number; failed: number; execAborted?: boolean }> {
   const cleaned = normalizeOptionalString(params.requesterSessionKey);
   if (!cleaned) {
     await params.beforeKill?.();
@@ -159,16 +160,28 @@ export async function stopSubagentsForRequester(params: {
     sessionKey: requesterKey,
     fallbackAgentId: params.requesterAgentId,
   });
+  const controller = {
+    controllerSessionKey: requesterKey,
+    controllerAgentId,
+    callerSessionKey: requesterKey,
+    callerIsSubagent: isSubagentSessionKey(requesterKey),
+    controlScope: "children" as const,
+  };
+  const commands = captureExecRequestCancellation({
+    sessionKey: requesterKey,
+    agentId: controllerAgentId,
+  });
+  const requestSelection = captureExecRequestSubagentSelection({
+    cfg: params.cfg,
+    controller,
+    owners: commands.owners,
+  });
   const result = await killAllControlledSubagentRuns({
     cfg: params.cfg,
-    controller: {
-      controllerSessionKey: requesterKey,
-      controllerAgentId,
-      callerSessionKey: requesterKey,
-      callerIsSubagent: isSubagentSessionKey(requesterKey),
-      controlScope: "children",
-    },
-    runs: listRunsForControllerFromRuns(subagentRuns, requesterKey),
+    controller,
+    runs: requestSelection.runs,
+    requestSelection,
+    assertCurrent: params.assertCurrent,
     suppressTaskDelivery: true,
     beforeKill: params.beforeKill,
   });
@@ -178,7 +191,11 @@ export async function stopSubagentsForRequester(params: {
   if (result.killed > 0) {
     logVerbose(`abort: stopped ${result.killed} subagent run(s) for ${requesterKey}`);
   }
-  return { stopped: result.killed, failed: result.status === "error" ? result.failed : 0 };
+  return {
+    stopped: result.killed,
+    failed: result.status === "error" ? result.failed : 0,
+    ...(result.execAborted ? { execAborted: true } : {}),
+  };
 }
 
 export async function executeFastAbortRequest(
@@ -242,10 +259,15 @@ export async function executeFastAbortRequest(
     let activeAbortRejected = false;
     const acpCancellations: Promise<void>[] = [];
     try {
-      const { stopped, failed } = await stopSubagentsForRequester({
+      const { stopped, failed, execAborted } = await stopSubagentsForRequester({
         cfg,
         requesterSessionKey,
         requesterAgentId: agentId,
+        assertCurrent: () => {
+          if (params.isCommandTargetCurrent?.() === false) {
+            throw new Error("The selected session changed before it could be stopped.");
+          }
+        },
         beforeKill: () => {
           const assertCurrent = () => {
             if (params.isCommandTargetCurrent?.() === false) {
@@ -335,6 +357,7 @@ export async function executeFastAbortRequest(
           return true;
         },
       });
+      aborted ||= execAborted === true;
       const rejectionReason = activeAbortRejected && !aborted ? "finalizing" : undefined;
       if (!rejectionReason) {
         let persistedAbortTarget: SessionAbortTargetResult | null = null;
@@ -388,10 +411,13 @@ export async function executeFastAbortRequest(
   if (abortKey) {
     setAbortMemory(abortKey, true);
   }
-  const { stopped, failed } = await stopSubagentsForRequester({ cfg, requesterSessionKey });
+  const { stopped, failed, execAborted } = await stopSubagentsForRequester({
+    cfg,
+    requesterSessionKey,
+  });
   return {
     handled: true,
-    aborted: false,
+    aborted: execAborted === true,
     stoppedSubagents: stopped,
     failedSubagents: failed,
   };

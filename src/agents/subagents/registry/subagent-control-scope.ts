@@ -1,4 +1,5 @@
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
+import type { ExecRequestOwner } from "../../../infra/exec-request-context.js";
 import { isSystemEventStoreCurrent } from "../../../infra/system-event-ownership.js";
 import {
   isSubagentSessionKey,
@@ -15,6 +16,7 @@ import {
 import { resolveStoredSubagentCapabilities } from "../spawn/subagent-capabilities.js";
 import type { SessionCapabilityLookup } from "../spawn/subagent-session-store.js";
 import { matchesSubagentChildSessionOwner } from "./subagent-child-owner-match.js";
+import { readSubagentExecRequestController } from "./subagent-exec-request-ownership.js";
 import { observeSubagentExecution } from "./subagent-execution-observation.js";
 import { captureSubagentListReadContext, type SubagentListReadContext } from "./subagent-list.js";
 import { getSubagentRunsForRequesterSession, subagentRuns } from "./subagent-registry-memory.js";
@@ -37,6 +39,7 @@ import { isRequesterSettleWakeForRun } from "./subagent-requester-settle-identit
 import {
   isSameSubagentRun,
   isSameSubagentRunOwner,
+  getSubagentRunRuntimeKey,
   latestSubagentRun,
 } from "./subagent-run-generation.js";
 
@@ -135,6 +138,65 @@ export function listControlledSubagentRunsForTurn(
         runsById,
       }),
   );
+}
+
+export type ExecRequestSubagentSelection = {
+  runs: SubagentRunRecord[];
+  ownsRoot: (entry: SubagentRunRecord) => boolean;
+};
+
+/** Freeze native owners before cancellation yields; routed IDs never grant control. */
+export function captureExecRequestSubagentSelection(params: {
+  cfg: OpenClawConfig;
+  controller: ResolvedSubagentController;
+  requesterTurnRunId?: string;
+  owners: readonly ExecRequestOwner[];
+}): ExecRequestSubagentSelection {
+  const owners = new Set(params.owners);
+  const turnIds = params.requesterTurnRunId
+    ? [
+        ...new Set([
+          params.requesterTurnRunId,
+          ...params.owners.flatMap((owner) => [...owner.turnRunIds]),
+        ]),
+      ]
+    : [undefined];
+  type ControllerIdentity = Pick<
+    ResolvedSubagentController,
+    "controllerSessionKey" | "controllerAgentId"
+  >;
+  const selected = new Map<object, { entry: SubagentRunRecord; controller: ControllerIdentity }>();
+  const capture = (entry: SubagentRunRecord, controller: ControllerIdentity) => {
+    selected.set(getSubagentRunRuntimeKey(entry), { entry, controller });
+  };
+  for (const runId of turnIds) {
+    for (const entry of listControlledSubagentRunsForTurn(params.controller, runId)) {
+      capture(entry, params.controller);
+    }
+  }
+  if (owners.size > 0) {
+    for (const entry of subagentRuns.values()) {
+      const controller = readSubagentExecRequestController(entry, owners);
+      if (controller) {
+        capture(entry, controller);
+      }
+    }
+  }
+  return {
+    runs: [...selected.values()].map(({ entry }) => entry),
+    ownsRoot(entry) {
+      const captured = selected.get(getSubagentRunRuntimeKey(entry));
+      return Boolean(
+        captured &&
+        isSameSubagentRunOwner(entry, captured.entry) &&
+        !ensureSubagentControllerOwnsRun({
+          cfg: params.cfg,
+          controller: captured.controller,
+          entry,
+        }),
+      );
+    },
+  };
 }
 
 function resolveRunRequesterAgentId(

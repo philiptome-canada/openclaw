@@ -10,7 +10,7 @@ import { captureExecRequestCancellation } from "../../agents/bash-process-contro
 import { killSubagentRunAdmin } from "../../agents/subagents/registry/subagent-control-kill.js";
 import {
   ensureSubagentControllerOwnsRun,
-  listControlledSubagentRunsForTurn,
+  captureExecRequestSubagentSelection,
 } from "../../agents/subagents/registry/subagent-control-scope.js";
 import {
   killAllControlledSubagentRuns,
@@ -90,12 +90,11 @@ export async function abortControlledSubagents(params: {
       agentId: params.agentId,
       sessionId: params.sessionId,
     });
-  const turnIds = params.requesterTurnRunId
-    ? [...new Set([params.requesterTurnRunId, ...commands.requestRunIds])]
-    : [undefined];
-  const runs = [
-    ...new Set(turnIds.flatMap((runId) => listControlledSubagentRunsForTurn(controller, runId))),
-  ];
+  const requestSelection = captureExecRequestSubagentSelection({
+    ...params,
+    controller,
+    owners: commands.owners,
+  });
   let execAborted = false;
   const commandErrors: unknown[] = [];
   const beforeKill = async () => {
@@ -114,13 +113,14 @@ export async function abortControlledSubagents(params: {
   let descendants: Awaited<ReturnType<typeof killAllControlledSubagentRuns>> | undefined;
   let failure: { error: unknown } | undefined;
   try {
-    if (runs.length === 0) {
+    if (requestSelection.runs.length === 0) {
       await beforeKill();
     } else {
       descendants = await killAllControlledSubagentRuns({
         cfg: params.cfg,
         controller,
-        runs,
+        runs: requestSelection.runs,
+        requestSelection,
         suppressTaskDelivery: true,
         assertCurrent: params.assertCurrent,
         beforeKill,
@@ -148,13 +148,13 @@ export async function abortControlledSubagents(params: {
         ...(descendants && descendants.status !== "ok" ? [descendants.error] : []),
         ...commandErrors.map(formatErrorMessage),
       ].join("; "),
-      execAborted,
+      execAborted: execAborted || descendants?.execAborted === true,
     };
   }
   return descendants || execAborted
     ? {
         ...(descendants ?? { status: "ok" as const, killed: 0, labels: [] }),
-        execAborted,
+        execAborted: execAborted || descendants?.execAborted === true,
       }
     : undefined;
 }

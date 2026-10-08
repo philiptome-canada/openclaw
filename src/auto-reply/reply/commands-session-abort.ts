@@ -117,10 +117,15 @@ export const handleStopCommand: CommandHandler = defineAuthorizedTextCommand(
     let abortOutcome = { active: false, aborted: false };
     // Capture child generations before signalling the parent; cleanup must not discover
     // a replacement conversation's children after the original publisher finishes.
-    const { stopped, failed } = await stopSubagentsForRequester({
+    const { stopped, failed, execAborted } = await stopSubagentsForRequester({
       cfg: params.cfg,
       requesterSessionKey: abortTarget.key ?? params.sessionKey,
       requesterAgentId: params.agentId,
+      assertCurrent: () => {
+        if (params.opts?.isCommandTargetCurrent?.() === false) {
+          throw new Error("The selected session changed before it could be stopped.");
+        }
+      },
       beforeKill: async () => {
         abortOutcome = await applyAbortTarget(params, abortTarget, true);
 
@@ -141,7 +146,9 @@ export const handleStopCommand: CommandHandler = defineAuthorizedTextCommand(
     });
 
     const rejectionReason =
-      abortOutcome.active && !abortOutcome.aborted ? ("finalizing" as const) : undefined;
+      abortOutcome.active && !abortOutcome.aborted && !execAborted
+        ? ("finalizing" as const)
+        : undefined;
     return commandReply(formatAbortReplyText(stopped, rejectionReason, failed));
   },
 );

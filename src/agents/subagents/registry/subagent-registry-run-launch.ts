@@ -5,6 +5,7 @@ import {
   getAgentEventLifecycleGeneration,
   isAgentEventLifecycleGenerationCurrent,
 } from "../../../infra/agent-events.js";
+import { readExecRequestOwners } from "../../../infra/exec-request-context.js";
 import { hasSqliteWorkerOutcomeUnknown } from "../../../infra/sqlite-worker-contract.js";
 import {
   bindGatewayContextResolver,
@@ -27,6 +28,7 @@ import {
 } from "../swarm/swarm-collector.js";
 import { bindSwarmRunReservation, ownsSwarmRunReservation } from "../swarm/swarm-scheduler.js";
 import { matchesSubagentChildSessionOwner } from "./subagent-child-owner-match.js";
+import { bindSubagentExecRequestOwners } from "./subagent-exec-request-ownership.js";
 import { SUBAGENT_ENDED_REASON_ERROR } from "./subagent-lifecycle-events.js";
 import {
   getCurrentSubagentRunOwner,
@@ -349,6 +351,13 @@ export class SubagentLaunchManager extends SubagentRecoveryManager {
             registered = entry;
             try {
               options.assertPublicationCurrent?.();
+              bindSubagentExecRequestOwners(entry, readExecRequestOwners(options), {
+                controllerSessionKey,
+                controllerAgentId: resolveAgentIdFromSessionKey(
+                  controllerSessionKey,
+                  requesterAgentId,
+                ),
+              });
               if (authority?.operatorAuthority) {
                 subagentRuns.bindCompletionAuthority(entry, authority);
                 custodyTransferred = true;
